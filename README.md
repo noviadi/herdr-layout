@@ -62,7 +62,7 @@ Engine subcommands (`herdr-layout <subcommand>`):
 | `show <name>`       | Print a saved layout's JSON.                                       |
 | `rm <name>`         | Delete a saved layout.                                             |
 | `names`             | Machine-readable names (`builtin:<n>` / `saved:<n>`), one per line.|
-| `keys`              | Print the recommended keybinding TOML block for review + manager.  |
+| `keys`              | Print the recommended keybinding TOML block for the manager action. |
 | `-h` / `--help`     | Show help.                                                         |
 
 Flags:
@@ -95,20 +95,19 @@ The plugin manifest (`herdr-plugin.toml`) exposes:
 ### Keybindings
 
 Plugin actions are qualified as `<plugin_id>.<action_id>` and bound with
-`type = "plugin_action"`. Both `review` and `manager` are actions, so both are
-bindable (confirmed syntax — see https://herdr.dev/docs/plugins/ and
+`type = "plugin_action"`. The single recommended binding puts the
+`manager` action on `prefix+shift+l` (capital L). This key was chosen
+specifically to avoid clobbering two of Herdr's default bindings:
+`prefix+l` is `focus_pane_right` and `prefix+r` is `resize_mode`. The
+review layout needs no separate binding — it's available as menu
+option 2 inside the manager popup (confirmed syntax — see
+https://herdr.dev/docs/plugins/ and
 https://herdr.dev/docs/configuration/). Paste this into
 `~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
-key = "prefix+r"
-type = "plugin_action"
-command = "noviadi.herdr-layout.review"
-description = "Apply review layout"
-
-[[keys.command]]
-key = "prefix+l"
+key = "prefix+shift+l"
 type = "plugin_action"
 command = "noviadi.herdr-layout.manager"
 description = "Open layout manager"

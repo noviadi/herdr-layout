@@ -181,22 +181,17 @@ cmd_rm() {
 }
 
 # ---- keys (print recommended keybinding TOML) --------------------------------
-# Self-contained: no Herdr session required. Prints bindable plugin_action
-# bindings for both the `review` and `manager` actions, qualified
+# Self-contained: no Herdr session required. Prints a single bindable
+# plugin_action binding for the `manager` action, qualified
 # <plugin_id>.<action_id>, ready to paste into ~/.config/herdr/config.toml.
 cmd_keys() {
   cat <<'TOML'
 # herdr-layout keybindings — paste into ~/.config/herdr/config.toml.
-# Both bindings use type = "plugin_action" (bindable); the `manager` action
-# opens the layout-manager popup on a key.
+# Uses prefix+shift+l (capital L), chosen to avoid Herdr's defaults:
+#   prefix+l = focus_pane_right, prefix+r = resize_mode  (both taken).
+# The review layout is available inside the manager (menu option 2).
 [[keys.command]]
-key = "prefix+r"
-type = "plugin_action"
-command = "noviadi.herdr-layout.review"
-description = "Apply review layout"
-
-[[keys.command]]
-key = "prefix+l"
+key = "prefix+shift+l"
 type = "plugin_action"
 command = "noviadi.herdr-layout.manager"
 description = "Open layout manager"

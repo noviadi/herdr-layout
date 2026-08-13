@@ -65,12 +65,26 @@ else
   faild "manager.sh failed bash -n"
 fi
 
-# 7. keys exits 0 and prints the fully-qualified review action id.
+# 7. keys exits 0, prints the fully-qualified manager action id, and avoids
+#    clobbering Herdr's default bindings (prefix+r = resize_mode,
+#    prefix+l = focus_pane_right).
 keys_out="$("$SCRIPT" keys 2>/dev/null || true)"
-if [[ -n "$keys_out" ]] && grep -q 'noviadi.herdr-layout.review' <<<"$keys_out"; then
-  ok "keys prints noviadi.herdr-layout.review"
+if [[ -n "$keys_out" ]] && grep -q 'noviadi.herdr-layout.manager' <<<"$keys_out"; then
+  ok "keys prints noviadi.herdr-layout.manager"
 else
-  faild "keys did not print noviadi.herdr-layout.review"
+  faild "keys did not print noviadi.herdr-layout.manager"
+fi
+
+if grep -q 'key = "prefix+r"' <<<"$keys_out"; then
+  faild "keys recommends conflicting prefix+r (resize_mode)"
+else
+  ok "keys does not recommend prefix+r"
+fi
+
+if grep -q 'key = "prefix+l"' <<<"$keys_out"; then
+  faild "keys recommends conflicting prefix+l (focus_pane_right)"
+else
+  ok "keys does not recommend prefix+l"
 fi
 
 printf -- '----\n'

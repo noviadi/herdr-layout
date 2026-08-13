@@ -1,6 +1,6 @@
 id = "noviadi.herdr-layout"
 name = "Herdr Layout"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos"]
 description = "Save and replay Herdr pane layouts. Apply a review layout, or capture/restore your own."
