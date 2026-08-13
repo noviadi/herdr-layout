@@ -7,6 +7,7 @@
 #                                              Replay a saved (or built-in) layout.
 #   herdr-layout review [-y] [--cwd P]         Built-in review layout.
 #   herdr-layout list                          List saved + built-in layouts.
+#   herdr-layout names                         Machine-readable names (builtin:/saved:).
 #   herdr-layout show <name>                   Print a saved layout's JSON.
 #   herdr-layout rm <name>                     Delete a saved layout.
 #   herdr-layout -h | --help                   Show this help.
@@ -88,10 +89,13 @@ ws  = strv(ws_obj, "id") or strv(ws_obj, "workspace_id")
 tab = strv(tab_obj, "id") or strv(tab_obj, "tab_id")
 pane = strv(pane_obj, "id") or strv(pane_obj, "pane_id")
 
-# Top-level scalar keys take precedence if present.
+# Top-level scalar keys take precedence if present. In a Herdr plugin popup
+# the legacy HERDR_WORKSPACE_ID/HERDR_TAB_ID/HERDR_PANE_ID env vars are EMPTY,
+# and the context JSON is FLAT with focused_pane_id (there is no pane_id key),
+# so focused_pane_id must win for pane resolution.
 ws  = ws  or strv(d, "workspace_id") or strv(d, "workspaceId")
 tab = tab or strv(d, "tab_id")       or strv(d, "tabId")
-pane = pane or strv(d, "pane_id")    or strv(d, "paneId")
+pane = pane or strv(d, "focused_pane_id") or strv(d, "pane_id") or strv(d, "paneId")
 
 sys.stdout.write("%s\n%s\n%s\n" % (ws, tab, pane))
 PY
@@ -142,6 +146,22 @@ cmd_list() {
     (( found )) || echo "  (none)"
   else
     echo "  (none)"
+  fi
+}
+
+# ---- names (machine-readable, for the manager menu) -------------------------
+cmd_names() {
+  local b
+  for b in $BUILTINS; do
+    printf 'builtin:%s\n' "$b"
+  done
+  if [[ -d "$HERDR_LAYOUT_DIR" ]]; then
+    local f n
+    for f in "$HERDR_LAYOUT_DIR"/*.json; do
+      [[ -e "$f" ]] || continue
+      n="$(basename "$f" .json)"
+      printf 'saved:%s\n' "$n"
+    done
   fi
 }
 
@@ -554,6 +574,7 @@ case "$SUBCMD" in
   apply)  cmd_apply "$@" ;;
   review) cmd_review "$@" ;;
   list)   cmd_list ;;
+  names)  cmd_names ;;
   show)   cmd_show "${1:?show: name required}" ;;
   rm)     cmd_rm "${1:?rm: name required}" ;;
   *)      die "unknown command '$SUBCMD'. See: herdr-layout --help" ;;

@@ -2,6 +2,8 @@
 
 Save and replay Herdr pane layouts.
 
+A Herdr plugin manifest (`herdr-plugin.toml`) is included, exposing a "review" action and a popup layout manager.
+
 ## Install
 
 ```

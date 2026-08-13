@@ -1,0 +1,20 @@
+id = "noviadi.herdr-layout"
+name = "Herdr Layout"
+version = "0.1.0"
+min_herdr_version = "0.8.0"
+platforms = ["linux", "macos"]
+description = "Save and replay Herdr pane layouts. Apply a review layout, or capture/restore your own."
+
+[[actions]]
+id = "review"
+title = "Apply review layout"
+contexts = ["workspace"]
+command = ["bash", "herdr-layout", "review", "-y"]
+
+[[panes]]
+id = "manager"
+title = "Layout manager"
+placement = "popup"
+width = "70%"
+height = "60%"
+command = ["bash", "manager.sh"]

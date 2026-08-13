@@ -8,6 +8,7 @@ set -u
 
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$REPO_DIR/herdr-layout"
+MANAGER="$REPO_DIR/manager.sh"
 
 pass=0
 fail=0
@@ -47,6 +48,21 @@ if [[ "${HERDR_ENV:-}" == "1" ]]; then
   fi
 else
   printf 'SKIP: apply nope (not inside Herdr; HERDR_ENV != 1)\n'
+fi
+
+# 5. names exits 0 and prints at least builtin:review
+names_out="$("$SCRIPT" names 2>/dev/null || true)"
+if [[ -n "$names_out" ]] && grep -q '^builtin:review$' <<<"$names_out"; then
+  ok "names prints builtin:review"
+else
+  faild "names did not print builtin:review"
+fi
+
+# 6. manager.sh is syntactically valid
+if bash -n "$MANAGER" 2>/dev/null; then
+  ok "manager.sh syntactically valid (bash -n)"
+else
+  faild "manager.sh failed bash -n"
 fi
 
 printf -- '----\n'
