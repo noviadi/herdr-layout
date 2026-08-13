@@ -1,0 +1,560 @@
+#!/usr/bin/env bash
+# herdr-layout — save and replay Herdr pane layouts for the current tab.
+#
+# Usage:
+#   herdr-layout save <name> [-f]              Capture the current tab's layout.
+#   herdr-layout apply <name> [-y] [--cwd P] [--no-commands] [--close-agents]
+#                                              Replay a saved (or built-in) layout.
+#   herdr-layout review [-y] [--cwd P]         Built-in review layout.
+#   herdr-layout list                          List saved + built-in layouts.
+#   herdr-layout show <name>                   Print a saved layout's JSON.
+#   herdr-layout rm <name>                     Delete a saved layout.
+#   herdr-layout -h | --help                   Show this help.
+#
+# Layouts are stored as ${HERDR_LAYOUT_DIR}/<name>.json
+# (default ${HERDR_PLUGIN_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-layout}).
+#
+# The caller pane (where you run this) is preserved and becomes the anchor
+# (top-left) pane of the replayed layout. Any *other* panes in the current tab
+# are cleared to make room: panes hosting a running coding agent are MOVED to a
+# fresh tab (their session is preserved) unless --close-agents is given; plain
+# panes are closed. Agent invocations are captured for reference but never
+# re-run on apply.
+
+set -euo pipefail
+
+# ---- config -----------------------------------------------------------------
+# When invoked as a Herdr plugin, HERDR_PLUGIN_STATE_DIR points at the plugin's
+# private state dir; otherwise we fall back to the XDG config location. An
+# explicit HERDR_LAYOUT_DIR always wins.
+HERDR_LAYOUT_DIR="${HERDR_LAYOUT_DIR:-${HERDR_PLUGIN_STATE_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/herdr-layout}}"
+# The Herdr binary to drive. Plugin runtime may set HERDR_BIN_PATH to the exact
+# running binary; standalone usage falls back to whatever `herdr` is on PATH.
+HERDR="${HERDR_BIN_PATH:-herdr}"
+BUILTINS="review"
+
+# Coding-agent process names: captured but never replayed by `apply`.
+AGENTS_RE='(^|/)(claude|codex|cursor|opencode|agy|antigravity(-cli)?|grok|gemini|copilot|devin|droid|kimi|qodercli|mastracode|hermes|omp|pi|aider|amp|fbr|q)$'
+
+usage() { sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; }
+
+die() { echo "herdr-layout: $*" >&2; exit 1; }
+
+# ---- runtime context resolution ---------------------------------------------
+# Resolves the target workspace/tab/pane from the best available source and
+# exposes the results as the globals CTX_WORKSPACE_ID / CTX_TAB_ID / CTX_PANE_ID.
+#
+# Source precedence:
+#   1. HERDR_PLUGIN_CONTEXT_JSON  (plugin runtime; shape researched separately,
+#      so parsing is defensive — try several likely key paths, and if the JSON
+#      is present but shaped unexpectedly, fall through rather than crashing).
+#   2. HERDR_WORKSPACE_ID / HERDR_TAB_ID / HERDR_PANE_ID
+#      (legacy caller-context env vars for standalone use in a Herdr pane).
+CTX_WORKSPACE_ID=""
+CTX_TAB_ID=""
+CTX_PANE_ID=""
+resolve_context() {
+  CTX_WORKSPACE_ID=""
+  CTX_TAB_ID=""
+  CTX_PANE_ID=""
+
+  if [[ -n "${HERDR_PLUGIN_CONTEXT_JSON:-}" ]]; then
+    local resolved=""
+    resolved="$(HERDR_PLUGIN_CONTEXT_JSON="$HERDR_PLUGIN_CONTEXT_JSON" python3 - <<'PY' 2>/dev/null || true
+import json, os, sys
+raw = os.environ.get("HERDR_PLUGIN_CONTEXT_JSON", "")
+if not raw:
+    sys.exit(0)
+try:
+    d = json.loads(raw)
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+
+def strv(obj, key):
+    if not isinstance(obj, dict):
+        return ""
+    v = obj.get(key)
+    return str(v) if v not in (None, "") else ""
+
+ws = tab = pane = ""
+
+# Nested objects: workspace{...}, tab{...}, pane{...}.
+ws_obj  = d.get("workspace")  if isinstance(d.get("workspace"),  dict) else {}
+tab_obj = d.get("tab")        if isinstance(d.get("tab"),        dict) else {}
+pane_obj = d.get("pane")      if isinstance(d.get("pane"),       dict) else {}
+ws  = strv(ws_obj, "id") or strv(ws_obj, "workspace_id")
+tab = strv(tab_obj, "id") or strv(tab_obj, "tab_id")
+pane = strv(pane_obj, "id") or strv(pane_obj, "pane_id")
+
+# Top-level scalar keys take precedence if present.
+ws  = ws  or strv(d, "workspace_id") or strv(d, "workspaceId")
+tab = tab or strv(d, "tab_id")       or strv(d, "tabId")
+pane = pane or strv(d, "pane_id")    or strv(d, "paneId")
+
+sys.stdout.write("%s\n%s\n%s\n" % (ws, tab, pane))
+PY
+)"
+    if [[ -n "$resolved" ]]; then
+      local ws tab pane
+      { read -r ws; read -r tab; read -r pane; } <<<"$resolved"
+      CTX_WORKSPACE_ID="$ws"
+      CTX_TAB_ID="$tab"
+      CTX_PANE_ID="$pane"
+    fi
+  fi
+
+  # Legacy caller-context env vars as the final fallback.
+  [[ -n "$CTX_WORKSPACE_ID" ]] || CTX_WORKSPACE_ID="${HERDR_WORKSPACE_ID:-}"
+  [[ -n "$CTX_TAB_ID"       ]] || CTX_TAB_ID="${HERDR_TAB_ID:-}"
+  [[ -n "$CTX_PANE_ID"      ]] || CTX_PANE_ID="${HERDR_PANE_ID:-}"
+}
+
+# ---- herdr precondition -----------------------------------------------------
+require_herdr() {
+  [[ "${HERDR_ENV:-}" == "1" ]] || die "not running inside Herdr (HERDR_ENV is not 1). Run this from a Herdr-managed pane."
+  command -v "$HERDR" >/dev/null 2>&1 || die "'herdr' CLI not found (HERDR=$HERDR)."
+  resolve_context
+  : "${CTX_WORKSPACE_ID:?missing workspace id — set HERDR_PLUGIN_CONTEXT_JSON or HERDR_WORKSPACE_ID}"
+  : "${CTX_TAB_ID:?missing tab id — set HERDR_PLUGIN_CONTEXT_JSON or HERDR_TAB_ID}"
+  : "${CTX_PANE_ID:?missing pane id — set HERDR_PLUGIN_CONTEXT_JSON or HERDR_PANE_ID}"
+}
+
+valid_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]*$ ]]; }
+
+layout_path() { printf '%s/%s.json' "$HERDR_LAYOUT_DIR" "$1"; }
+
+# ---- list / show / rm -------------------------------------------------------
+cmd_list() {
+  echo "built-in:"
+  echo "  review   source tree (top-right) + lazygit (bottom-right), chat pane on the left"
+  echo "saved ($HERDR_LAYOUT_DIR):"
+  if [[ -d "$HERDR_LAYOUT_DIR" ]]; then
+    local found=0
+    for f in "$HERDR_LAYOUT_DIR"/*.json; do
+      [[ -e "$f" ]] || continue
+      found=1
+      local n; n="$(basename "$f" .json)"
+      local cwd; cwd="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("root_cwd","?"))' "$f" 2>/dev/null || echo "?")"
+      printf '  %s   (root: %s)\n' "$n" "$cwd"
+    done
+    (( found )) || echo "  (none)"
+  else
+    echo "  (none)"
+  fi
+}
+
+cmd_show() {
+  local name="$1"
+  local path; path="$(layout_path "$name")"
+  [[ -f "$path" ]] || die "no saved layout '$name'. Try: herdr-layout list"
+  cat "$path"
+}
+
+cmd_rm() {
+  local name="$1"
+  local path; path="$(layout_path "$name")"
+  [[ -f "$path" ]] || die "no saved layout '$name'."
+  rm -f "$path"; echo "removed '$name'."
+}
+
+# ---- helpers ----------------------------------------------------------------
+# ask_yes PROMPT: print PROMPT to stderr (always visible), read an answer from
+# /dev/tty then stdin. Returns 0 on yes, 1 on no. Dies if no tty at all.
+ask_yes() {
+  local prompt="$1" ans
+  printf '%s' "$prompt" >&2
+  if read -r ans </dev/tty 2>/dev/null; then :
+  elif IFS= read -r ans; then :
+  else printf '\n' >&2; die "no tty available for confirmation. Pass -y to skip."; fi
+  [[ "${ans:-}" =~ ^[Yy]$ ]]
+}
+
+# pane_is_agent PANE_ID: returns 0 if the pane's foreground process is a known
+# coding agent (so rebuild should preserve, not close, it).
+pane_is_agent() {
+  local info
+  info="$("$HERDR" pane process-info --pane "$1" 2>/dev/null)" || return 1
+  [[ -n "$info" ]] || return 1
+  AGENTS_RE="$AGENTS_RE" python3 -c '
+import json, os, re, sys
+rx = re.compile(os.environ["AGENTS_RE"])
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(2)
+procs = d["result"]["process_info"].get("foreground_processes") or []
+for p in procs:
+    name = (p.get("name") or "").rsplit("/", 1)[-1]
+    argv = p.get("argv") or []
+    if rx.match(name) or rx.match(" ".join(argv)):
+        sys.exit(0)
+sys.exit(1)
+' <<<"$info"
+}
+
+# ---- tab preparation (shared by apply & review) -----------------------------
+# Counts extra panes in the current tab, prompts, then on confirm:
+#   - MOVES agent panes to a fresh tab (preserves their sessions), unless
+#     CLOSE_AGENTS=1; plain panes are always closed.
+# Globals: ASSUME_YES, CLOSE_AGENTS, CTX_WORKSPACE_ID, CTX_TAB_ID, CTX_PANE_ID.
+prepare_tab() {
+  local label="$1"  # descriptive label for the prompt
+  local panes_json; panes_json="$("$HERDR" pane list --workspace "$CTX_WORKSPACE_ID")"
+  local -a other_panes=()
+  while IFS= read -r pid; do other_panes+=("$pid"); done < <(
+    CTX_TAB_ID="$CTX_TAB_ID" CTX_PANE_ID="$CTX_PANE_ID" python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)
+tab = os.environ["CTX_TAB_ID"]; me = os.environ["CTX_PANE_ID"]
+for p in d["result"]["panes"]:
+    if p["tab_id"] == tab and p["pane_id"] != me:
+        print(p["pane_id"])
+' <<<"$panes_json")
+
+  local -a agent_panes=() plain_panes=()
+  local pid
+  for pid in "${other_panes[@]}"; do
+    if pane_is_agent "$pid"; then agent_panes+=("$pid"); else plain_panes+=("$pid"); fi
+  done
+
+  if [[ "${HERDR_LAYOUT_DEBUG:-}" == "1" ]]; then
+    printf '  [debug] extra=%d agent=%d plain=%d\n' \
+      "${#other_panes[@]}" "${#agent_panes[@]}" "${#plain_panes[@]}" >&2
+  fi
+
+  # Build the prompt.
+  local prompt
+  if (( ${#other_panes[@]} == 0 )); then
+    prompt="Apply the '$label' layout here? [y/N] "
+  else
+    local n=${#other_panes[@]} na=${#agent_panes[@]}
+    if (( na > 0 )) && (( ! CLOSE_AGENTS )); then
+      prompt="This tab has $n extra pane(s) ($na agent). Rebuild into '$label'? Agents will be MOVED to a new tab, others closed. [y/N] "
+    elif (( na > 0 )); then
+      prompt="This tab has $n extra pane(s) ($na agent). Rebuild into '$label' and CLOSE ALL (including agents)? [y/N] "
+    else
+      prompt="This tab has $n extra pane(s). Rebuild into '$label' (they will be closed)? [y/N] "
+    fi
+  fi
+
+  if (( ! ASSUME_YES )); then
+    ask_yes "$prompt" || { echo; echo "Aborted."; exit 0; }
+    echo >&2
+  fi
+
+  # Act: move or close agents, always close plain panes.
+  if (( ${#agent_panes[@]} > 0 )) && (( ! CLOSE_AGENTS )); then
+    for pid in "${agent_panes[@]}"; do
+      "$HERDR" pane move "$pid" --new-tab --no-focus >/dev/null 2>&1 \
+        && echo "moved agent pane $pid to a new tab (preserved)" || \
+        echo "herdr-layout: could not move agent pane $pid — left in place" >&2
+    done
+  else
+    for pid in "${agent_panes[@]}"; do
+      "$HERDR" pane close "$pid" >/dev/null 2>&1 || true
+    done
+  fi
+  for pid in "${plain_panes[@]}"; do
+    "$HERDR" pane close "$pid" >/dev/null 2>&1 || true
+  done
+}
+
+# ---- save (capture) ---------------------------------------------------------
+cmd_save() {
+  require_herdr
+  local name="" force=0
+  while (("$#")); do
+    case "$1" in
+      -f|--force) force=1; shift ;;
+      -*) die "save: unknown option '$1'" ;;
+      *)  [[ -z "$name" ]] || die "save: unexpected extra argument '$1'"; name="$1"; shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "save: name required. Usage: herdr-layout save <name>"
+  valid_name "$name" || die "save: invalid name '$name' (use lowercase, digits, - or _)."
+  # Built-in layout names are reserved: apply always maps them to the built-in,
+  # so a saved file under the same name would be silently unreachable.
+  local b
+  for b in $BUILTINS; do
+    [[ "$name" == "$b" ]] && die "save: '$name' is a reserved built-in layout name. Apply it via 'herdr-layout apply $name', or save under a different name."
+  done
+
+  mkdir -p "$HERDR_LAYOUT_DIR"
+  local path; path="$(layout_path "$name")"
+  if [[ -f "$path" && $force -ne 1 ]] && (( ! ASSUME_YES )); then
+    ask_yes "Layout '$name' exists. Overwrite? [y/N] " || { echo; echo "Aborted."; exit 0; }
+    echo >&2
+  fi
+
+  AGENTS_RE="$AGENTS_RE" HERDR_LAYOUT_PATH="$path" HERDR_LAYOUT_NAME="$name" \
+  CTX_WORKSPACE_ID="$CTX_WORKSPACE_ID" CTX_TAB_ID="$CTX_TAB_ID" CTX_PANE_ID="$CTX_PANE_ID" \
+    python3 - <<'PY'
+import json, os, re, subprocess, sys, datetime
+
+AGENTS_RE = re.compile(os.environ["AGENTS_RE"])
+SHELL_NAMES = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh"}
+HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
+
+def herdr_json(args):
+    out = subprocess.run([HERDR, *args], capture_output=True, text=True, check=True).stdout
+    return json.loads(out)["result"]
+
+layout = herdr_json(["pane", "layout", "--pane", os.environ["CTX_PANE_ID"]])["layout"]
+panes_list = herdr_json(["pane", "list", "--workspace", os.environ["CTX_WORKSPACE_ID"]])["panes"]
+# restrict to the current tab (pane list spans the whole workspace)
+panes_list = [p for p in panes_list if p["tab_id"] == os.environ["CTX_TAB_ID"]]
+
+# pane_id -> cwd from the live pane list
+cwd_by_pane = {p["pane_id"]: (p.get("foreground_cwd") or p.get("cwd") or "") for p in panes_list}
+
+def describe_pane(pane_id):
+    info = herdr_json(["pane", "process-info", "--pane", pane_id])["process_info"]
+    procs = info.get("foreground_processes") or []
+    shell_pid = info.get("shell_pid")
+    proc = procs[0] if procs else {}
+    name = (proc.get("name") or "").rsplit("/", 1)[-1]
+    argv = proc.get("argv") or []
+    is_shell = name in SHELL_NAMES or (procs and procs[0].get("pid") == shell_pid and name in SHELL_NAMES)
+    is_agent = bool(AGENTS_RE.match(" ".join(argv))) or bool(name and AGENTS_RE.match(name))
+    cmd = "" if (is_shell or is_agent or not argv) else " ".join(argv)
+    return {
+        "name": name,
+        "cmd": cmd,
+        "is_shell": is_shell,
+        "is_agent": is_agent,
+        "cwd": (proc.get("cwd") or cwd_by_pane.get(pane_id) or ""),
+    }
+
+panes = []
+for p in layout["panes"]:
+    r = p["rect"]
+    d = describe_pane(p["pane_id"])
+    panes.append({
+        "pane_id": p["pane_id"],
+        "rect": r,
+        **d,
+    })
+
+def bounds(ps):
+    xs = [q["rect"]["x"] for q in ps]; Xs = [q["rect"]["x"] + q["rect"]["width"] for q in ps]
+    ys = [q["rect"]["y"] for q in ps]; Ys = [q["rect"]["y"] + q["rect"]["height"] for q in ps]
+    return min(xs), max(Xs), min(ys), max(Ys)
+
+def find_cut(ps):
+    minx, maxx, miny, maxy = bounds(ps)
+    xs = sorted({q["rect"]["x"] for q in ps} | {q["rect"]["x"] + q["rect"]["width"] for q in ps})
+    for x in xs:
+        if x <= minx or x >= maxx:
+            continue
+        left = [q for q in ps if q["rect"]["x"] + q["rect"]["width"] <= x]
+        right = [q for q in ps if q["rect"]["x"] >= x]
+        if left and right and len(left) + len(right) == len(ps):
+            return ("right", left, right)
+    ys = sorted({q["rect"]["y"] for q in ps} | {q["rect"]["y"] + q["rect"]["height"] for q in ps})
+    for y in ys:
+        if y <= miny or y >= maxy:
+            continue
+        top = [q for q in ps if q["rect"]["y"] + q["rect"]["height"] <= y]
+        bot = [q for q in ps if q["rect"]["y"] >= y]
+        if top and bot and len(top) + len(bot) == len(ps):
+            return ("down", top, bot)
+    raise RuntimeError("no full cut found; layout is not a simple split tree")
+
+def leaf(p):
+    return {"type": "leaf", "cwd": p["cwd"], "cmd": p["cmd"],
+            "name": p["name"], "is_shell": p["is_shell"], "is_agent": p["is_agent"]}
+
+def build(ps):
+    if len(ps) == 1:
+        return leaf(ps[0])
+    direction, first_ps, second_ps = find_cut(ps)
+    minx, maxx, miny, maxy = bounds(ps)
+    if direction == "right":
+        fminx, fmaxx, _, _ = bounds(first_ps)
+        ratio = (fmaxx - fminx) / (maxx - minx)
+    else:
+        _, _, fminy, fmaxy = bounds(first_ps)
+        ratio = (fmaxy - fminy) / (maxy - miny)
+    return {
+        "type": "split",
+        "direction": direction,       # right=vertical cut, down=horizontal cut
+        "ratio": round(ratio, 5),     # fraction kept by the first (anchor) side
+        "first": build(first_ps),
+        "second": build(second_ps),
+    }
+
+root_cwd = next((p["cwd"] for p in panes if p["pane_id"] == os.environ["CTX_PANE_ID"]), panes[0]["cwd"])
+doc = {
+    "name": os.environ["HERDR_LAYOUT_NAME"],
+    "version": 1,
+    "captured_at": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+    "root_pane_id": os.environ["CTX_PANE_ID"],
+    "root_cwd": root_cwd,
+    "tree": build(panes),
+}
+with open(os.environ["HERDR_LAYOUT_PATH"], "w") as fh:
+    json.dump(doc, fh, indent=2)
+    fh.write("\n")
+
+def count(node):
+    if node["type"] == "leaf":
+        return 1, ([node["cmd"]] if node["cmd"] else [])
+    a, ca = count(node["first"]); b, cb = count(node["second"])
+    return a + b, ca + cb
+
+n, cmds = count(doc["tree"])
+print(f"saved '{doc['name']}' ({n} panes, {len(cmds)} command(s) captured) -> {os.environ['HERDR_LAYOUT_PATH']}")
+PY
+}
+
+# ---- apply (replay) ---------------------------------------------------------
+cmd_apply() {
+  require_herdr
+  local name="" cwd_override="" no_commands=0
+  while (("$#")); do
+    case "$1" in
+      --cwd) cwd_override="${2:?--cwd needs a value}"; shift 2 ;;
+      --no-commands) no_commands=1; shift ;;
+      *)  [[ -z "$name" ]] || die "apply: unexpected extra argument '$1'"; name="$1"; shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "apply: name required. Usage: herdr-layout apply <name>"
+
+  # Built-in review is implemented natively below.
+  if [[ "$name" == "review" ]]; then
+    prepare_tab "review"; apply_review "${cwd_override:-$PWD}"; return
+  fi
+
+  local path; path="$(layout_path "$name")"
+  [[ -f "$path" ]] || die "no saved layout '$name'. Try: herdr-layout list"
+
+  [[ -z "$cwd_override" || -d "$cwd_override" ]] || die "apply: --cwd does not exist: $cwd_override"
+
+  prepare_tab "$name"
+
+  AGENTS_RE="$AGENTS_RE" HERDR_LAYOUT_PATH="$path" \
+  CWD_OVERRIDE="$cwd_override" NO_COMMANDS="$no_commands" \
+  CTX_PANE_ID="$CTX_PANE_ID" \
+    python3 - <<'PY'
+import json, os, shlex, subprocess, sys
+
+HERDR = os.environ.get("HERDR_BIN_PATH", "herdr")
+
+doc = json.load(open(os.environ["HERDR_LAYOUT_PATH"]))
+cwd_override = os.environ.get("CWD_OVERRIDE") or ""
+no_commands = os.environ["NO_COMMANDS"] == "1"
+anchor = os.environ["CTX_PANE_ID"]
+
+def herdr(args, capture=False):
+    return subprocess.run([HERDR, *args], capture_output=True, text=True, check=True)
+
+def split_pane(pane_id, direction, ratio, cwd):
+    args = ["pane", "split", "--pane", pane_id, "--direction", direction,
+            "--ratio", str(ratio), "--no-focus"]
+    if cwd:
+        args += ["--cwd", cwd]
+    out = herdr(args).stdout
+    return json.loads(out)["result"]["pane"]["pane_id"]
+
+def first_leaf_cwd(node):
+    while node["type"] == "split":
+        node = node["first"]
+    return node.get("cwd") or ""
+
+def populate(pane_id, leaf):
+    cwd = cwd_override or leaf.get("cwd") or ""
+    parts = []
+    if cwd:
+        parts.append(f"cd {shlex.quote(cwd)}")
+    cmd = leaf.get("cmd") or ""
+    if cmd and not no_commands and not leaf.get("is_shell") and not leaf.get("is_agent"):
+        parts.append(cmd)
+    if parts:
+        herdr(["pane", "run", pane_id, " && ".join(parts)])
+
+def apply_node(node, pane_id, is_root):
+    if node["type"] == "leaf":
+        if not is_root:
+            populate(pane_id, node)
+        return
+    second_cwd = cwd_override or first_leaf_cwd(node["second"])
+    new_id = split_pane(pane_id, node["direction"], node["ratio"], second_cwd)
+    apply_node(node["first"], pane_id, is_root)        # anchor side keeps the pane id
+    apply_node(node["second"], new_id, False)
+
+def count(node):
+    if node["type"] == "leaf":
+        return 1
+    return count(node["first"]) + count(node["second"])
+
+apply_node(doc["tree"], anchor, True)
+print(f"applied '{doc['name']}' ({count(doc['tree'])} panes). Anchor pane {anchor} left untouched.")
+PY
+}
+
+# ---- built-in review layout (unchanged) -------------------------------------
+apply_review() {
+  local cwd="${1:?apply_review: cwd required}"
+  [[ -d "$cwd" ]] || die "review: cwd does not exist: $cwd"
+  cwd="$(cd "$cwd" && pwd)"
+  local src git
+  src=$("$HERDR" pane split --current --direction right --ratio 0.5 --cwd "$cwd" --no-focus \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
+  git=$("$HERDR" pane split --pane "$src" --direction down --ratio 0.45 --cwd "$cwd" --no-focus \
+        | python3 -c 'import sys,json;print(json.load(sys.stdin)["result"]["pane"]["pane_id"])')
+  "$HERDR" pane run "$src" \
+    'eza --tree --level=2 --git --group-directories-first 2>/dev/null || ls -la' \
+    >/dev/null 2>&1 || true
+  if command -v lazygit >/dev/null 2>&1; then
+    "$HERDR" pane run "$git" 'lazygit' >/dev/null 2>&1 || true
+  else
+    "$HERDR" pane run "$git" 'git status --short --branch && git log --oneline -10' >/dev/null 2>&1 || true
+  fi
+  echo "review: chat=left, source=$src (top-right), git=$git (bottom-right)"
+}
+
+cmd_review() {
+  require_herdr
+  local cwd="$PWD"
+  while (("$#")); do
+    case "$1" in
+      --cwd) cwd="${2:?--cwd needs a value}"; shift 2 ;;
+      *) die "review: unknown option '$1'" ;;
+    esac
+  done
+  prepare_tab "review"
+  apply_review "$cwd"
+}
+
+# ---- dispatch ---------------------------------------------------------------
+ASSUME_YES=0
+CLOSE_AGENTS=0
+SUBCMD="${1:-}"
+
+if [[ "$SUBCMD" == "-h" || "$SUBCMD" == "--help" || -z "$SUBCMD" ]]; then
+  usage; [[ -z "$SUBCMD" ]] && exit 0 || exit 0
+fi
+shift
+
+# Pull global flags (-y/--yes, --close-agents) out wherever they appear.
+args=()
+for a in "$@"; do
+  case "$a" in
+    -y|--yes) ASSUME_YES=1 ;;
+    --close-agents) CLOSE_AGENTS=1 ;;
+    *) args+=("$a") ;;
+  esac
+done
+set -- "${args[@]}"
+
+case "$SUBCMD" in
+  save)   cmd_save "$@" ;;
+  apply)  cmd_apply "$@" ;;
+  review) cmd_review "$@" ;;
+  list)   cmd_list ;;
+  show)   cmd_show "${1:?show: name required}" ;;
+  rm)     cmd_rm "${1:?rm: name required}" ;;
+  *)      die "unknown command '$SUBCMD'. See: herdr-layout --help" ;;
+esac
