@@ -65,6 +65,14 @@ else
   faild "manager.sh failed bash -n"
 fi
 
+# 7. keys exits 0 and prints the fully-qualified review action id.
+keys_out="$("$SCRIPT" keys 2>/dev/null || true)"
+if [[ -n "$keys_out" ]] && grep -q 'noviadi.herdr-layout.review' <<<"$keys_out"; then
+  ok "keys prints noviadi.herdr-layout.review"
+else
+  faild "keys did not print noviadi.herdr-layout.review"
+fi
+
 printf -- '----\n'
 printf 'smoke: %d passed, %d failed\n' "$pass" "$fail"
 (( fail == 0 ))

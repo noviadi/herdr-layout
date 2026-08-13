@@ -62,6 +62,7 @@ Engine subcommands (`herdr-layout <subcommand>`):
 | `show <name>`       | Print a saved layout's JSON.                                       |
 | `rm <name>`         | Delete a saved layout.                                             |
 | `names`             | Machine-readable names (`builtin:<n>` / `saved:<n>`), one per line.|
+| `keys`              | Print the recommended keybinding TOML block for review + manager.  |
 | `-h` / `--help`     | Show help.                                                         |
 
 Flags:
@@ -80,16 +81,24 @@ The plugin manifest (`herdr-plugin.toml`) exposes:
 
 - **Action `review`** (id `review`, title "Apply review layout") — runs
   `herdr-layout review -y` in the current workspace context.
-- **Pane `manager`** (id `manager`, title "Layout manager") — a popup
+- **Action `manager`** (id `manager`, title "Open layout manager") — opens the
+  layout-manager popup pane. Implemented as an action (rather than relying on
+  `herdr plugin pane open …` typed by hand) specifically so it can be put on a
+  key: Herdr's keybinding types are `popup`, `pane`, `shell`, and
+  `plugin_action`, and only `plugin_action` can target plugin surfaces, so the
+  popup is reached via this bindable action whose command runs
+  `"$HERDR_BIN_PATH" plugin pane open --plugin noviadi.herdr-layout --entrypoint manager`.
+- **Pane `manager`** (id `manager`, title "Layout manager") — the popup itself
   (`placement = "popup"`, 70% x 60%) running `manager.sh`, the interactive
   menu: list / apply review / apply saved / save / remove / quit.
 
 ### Keybindings
 
-Bind the `review` action to a key (confirmed syntax — see
-https://herdr.dev/docs/plugins/ and https://herdr.dev/docs/configuration/):
-plugin actions are qualified as `<plugin_id>.<action_id>` and bound with
-`type = "plugin_action"`:
+Plugin actions are qualified as `<plugin_id>.<action_id>` and bound with
+`type = "plugin_action"`. Both `review` and `manager` are actions, so both are
+bindable (confirmed syntax — see https://herdr.dev/docs/plugins/ and
+https://herdr.dev/docs/configuration/). Paste this into
+`~/.config/herdr/config.toml`:
 
 ```toml
 [[keys.command]]
@@ -97,24 +106,16 @@ key = "prefix+r"
 type = "plugin_action"
 command = "noviadi.herdr-layout.review"
 description = "Apply review layout"
-```
 
-Opening the `manager` popup from a key is not explicitly documented. The
-most likely form, by analogy with `plugin_action`, is a pane-type binding
-referring to the manifest pane id `noviadi.herdr-layout.manager`. Treat the
-field below as an assumption until you confirm it in Herdr's keybind settings:
-
-```toml
-# Assumption — no documented keybinding type for plugin panes as of Herdr 0.8.
-# Verify the exact type/fields in Herdr's keybind settings UI.
 [[keys.command]]
-key = "prefix+m"
-type = "plugin_pane"
+key = "prefix+l"
+type = "plugin_action"
 command = "noviadi.herdr-layout.manager"
 description = "Open layout manager"
 ```
 
-The manager is always reachable via the plugin's pane entry regardless.
+Run `herdr-layout keys` to print this same block to stdout. The manager is
+always reachable via the plugin's pane entry regardless.
 
 ## How it works
 

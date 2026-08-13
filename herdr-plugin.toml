@@ -1,6 +1,6 @@
 id = "noviadi.herdr-layout"
 name = "Herdr Layout"
-version = "0.1.0"
+version = "0.2.0"
 min_herdr_version = "0.8.0"
 platforms = ["linux", "macos"]
 description = "Save and replay Herdr pane layouts. Apply a review layout, or capture/restore your own."
@@ -10,6 +10,12 @@ id = "review"
 title = "Apply review layout"
 contexts = ["workspace"]
 command = ["bash", "herdr-layout", "review", "-y"]
+
+[[actions]]
+id = "manager"
+title = "Open layout manager"
+contexts = ["workspace"]
+command = ["bash", "-c", "\"$HERDR_BIN_PATH\" plugin pane open --plugin noviadi.herdr-layout --entrypoint manager"]
 
 [[panes]]
 id = "manager"

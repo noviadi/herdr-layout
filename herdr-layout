@@ -10,6 +10,7 @@
 #   herdr-layout names                         Machine-readable names (builtin:/saved:).
 #   herdr-layout show <name>                   Print a saved layout's JSON.
 #   herdr-layout rm <name>                     Delete a saved layout.
+#   herdr-layout keys                          Print recommended keybinding TOML.
 #   herdr-layout -h | --help                   Show this help.
 #
 # Layouts are stored as ${HERDR_LAYOUT_DIR}/<name>.json
@@ -177,6 +178,29 @@ cmd_rm() {
   local path; path="$(layout_path "$name")"
   [[ -f "$path" ]] || die "no saved layout '$name'."
   rm -f "$path"; echo "removed '$name'."
+}
+
+# ---- keys (print recommended keybinding TOML) --------------------------------
+# Self-contained: no Herdr session required. Prints bindable plugin_action
+# bindings for both the `review` and `manager` actions, qualified
+# <plugin_id>.<action_id>, ready to paste into ~/.config/herdr/config.toml.
+cmd_keys() {
+  cat <<'TOML'
+# herdr-layout keybindings — paste into ~/.config/herdr/config.toml.
+# Both bindings use type = "plugin_action" (bindable); the `manager` action
+# opens the layout-manager popup on a key.
+[[keys.command]]
+key = "prefix+r"
+type = "plugin_action"
+command = "noviadi.herdr-layout.review"
+description = "Apply review layout"
+
+[[keys.command]]
+key = "prefix+l"
+type = "plugin_action"
+command = "noviadi.herdr-layout.manager"
+description = "Open layout manager"
+TOML
 }
 
 # ---- helpers ----------------------------------------------------------------
@@ -575,6 +599,7 @@ case "$SUBCMD" in
   review) cmd_review "$@" ;;
   list)   cmd_list ;;
   names)  cmd_names ;;
+  keys)   cmd_keys ;;
   show)   cmd_show "${1:?show: name required}" ;;
   rm)     cmd_rm "${1:?rm: name required}" ;;
   *)      die "unknown command '$SUBCMD'. See: herdr-layout --help" ;;
